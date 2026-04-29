@@ -1,0 +1,7 @@
+data/
+*.csv
+*.npz
+*.pkl
+*.h5
+__pycache__/
+*.pt
