@@ -1,5 +1,8 @@
 # TAGM-STGCN: Temporal Adaptive Graph Memory for Traffic Forecasting
 
+TAGM-STGCN achieves competitive performance with dynamic graph learning 
+while maintaining stable predictions across longer horizons.
+
 ## Overview
 
 This project implements a spatio-temporal graph neural network for traffic forecasting, extending the standard STGCN framework with dynamic graph learning, memory mechanisms, and regime-aware adaptation.
@@ -7,6 +10,12 @@ This project implements a spatio-temporal graph neural network for traffic forec
 Traditional traffic forecasting models rely on static graph structures, which fail to capture temporal variations in traffic patterns. This work introduces adaptive graph representations that evolve over time, improving predictive performance and robustness.
 
 ---
+
+## Why This Matters
+
+Traffic patterns are highly dynamic. Static graph models fail to capture
+these variations. This work demonstrates that adaptive graph structures
+improve robustness and generalization.
 
 ## Key Contributions
 
