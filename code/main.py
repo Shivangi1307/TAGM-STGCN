@@ -1,364 +1,279 @@
 import json
-import os
-import logging
-import argparse
-import random
-import warnings
-
-import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn import preprocessing
 from sklearn.metrics import confusion_matrix
-
+import logging, os, argparse, random, warnings, tqdm
+import numpy as np, pandas as pd
+from sklearn import preprocessing
 import torch
 import torch.nn as nn
 import torch.utils as utils
-
 from code.script import dataloader, utility, earlystopping
 from code.model import models
 
 # ================= SEED =================
-
 def set_env(seed):
-os.environ['PYTHONHASHSEED'] = str(seed)
-random.seed(seed)
-np.random.seed(seed)
-torch.manual_seed(seed)
-torch.cuda.manual_seed_all(seed)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic=True
+    torch.backends.cudnn.benchmark=False
 
 # ================= ARGS =================
-
 def get_parameters():
-parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--use_dynamic', type=int, default=0)
+    parser.add_argument('--use_alpha', type=int, default=0)
+    parser.add_argument('--num_heads', type=int, default=1)
+    parser.add_argument('--dataset', type=str, default='pems-bay')
+    parser.add_argument('--seed', type=int, default=42)
 
-```
-parser.add_argument('--use_dynamic', type=int, default=0)
-parser.add_argument('--use_alpha', type=int, default=0)
-parser.add_argument('--num_heads', type=int, default=1)
-parser.add_argument('--dataset', type=str, default='pems-bay')
-parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--n_his', type=int, default=12)
+    parser.add_argument('--n_pred', type=int, default=12)
+    parser.add_argument('--Kt', type=int, default=3)
+    parser.add_argument('--stblock_num', type=int, default=2)
+    parser.add_argument('--act_func', type=str, default='glu')
+    parser.add_argument('--Ks', type=int, default=3)
+    parser.add_argument('--graph_conv_type', type=str, default='cheb_graph_conv')
+    parser.add_argument('--gso_type', type=str, default='sym_norm_lap')
+    parser.add_argument('--enable_bias', type=bool, default=True)
+    
+    parser.add_argument('--droprate', type=float, default=0.05)
+    parser.add_argument('--lr', type=float, default=0.001)
+    parser.add_argument('--batch_size', type=int, default=50)
+    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--patience', type=int, default=50)
 
-# Model settings
-parser.add_argument('--n_his', type=int, default=12)
-parser.add_argument('--n_pred', type=int, default=12)
-parser.add_argument('--Kt', type=int, default=3)
-parser.add_argument('--stblock_num', type=int, default=2)
-parser.add_argument('--act_func', type=str, default='glu')
-parser.add_argument('--Ks', type=int, default=3)
-parser.add_argument('--graph_conv_type', type=str, default='cheb_graph_conv')
-parser.add_argument('--gso_type', type=str, default='sym_norm_lap')
-parser.add_argument('--enable_bias', type=bool, default=True)
-
-# Training settings
-parser.add_argument('--droprate', type=float, default=0.05)
-parser.add_argument('--lr', type=float, default=0.001)
-parser.add_argument('--batch_size', type=int, default=50)
-parser.add_argument('--epochs', type=int, default=50)
-parser.add_argument('--patience', type=int, default=50)
-
-args = parser.parse_args()
-print("Configuration:", args)
-
-set_env(args.seed)
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-Ko = args.n_his - (args.Kt - 1) * 2 * args.stblock_num
-
-blocks = [[1]]
-for _ in range(args.stblock_num):
-    blocks.append([64, 16, 64])
-
-if Ko > 0:
-    blocks.append([128, 128])
-else:
-    blocks.append([128])
-
-blocks.append([1])
-
-return args, device, blocks
-```
+    args = parser.parse_args()
+    print("BASELINE CONFIG:", args)
+    set_env(args.seed)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    Ko = args.n_his - (args.Kt-1)*2*args.stblock_num
+    blocks = [[1]]
+    for _ in range(args.stblock_num):
+        blocks.append([64,16,64])
+    if Ko > 0:
+        blocks.append([128,128])
+    else:
+        blocks.append([128])
+    blocks.append([1])
+    return args, device, blocks
 
 # ================= DATA =================
+def data_preparate(args, device):
+    adj, n_vertex = dataloader.load_adj(args.dataset)
+    gso = utility.calc_gso(adj, args.gso_type)
+    gso = utility.calc_chebynet_gso(gso)
+    gso = torch.from_numpy(gso.toarray().astype(np.float32)).to(device)
+    args.gso = gso
+    data_path = f'./data/{args.dataset}/vel.csv'
+    if not os.path.exists(data_path):
+        raise FileNotFoundError(f"Dataset not found at {data_path}")
+    data = pd.read_csv(data_path)
+    total = len(data)
+    train_len = int(total*0.7)
+    val_len = int(total*0.1)
+    train = data[:train_len]
+    val = data[train_len:train_len+val_len]
+    test = data[train_len+val_len:]
 
-def data_prepare(args, device):
+    scaler = preprocessing.StandardScaler()
+    train = scaler.fit_transform(train)
+    val = scaler.transform(val)
+    test = scaler.transform(test)
 
-```
-adj, n_vertex = dataloader.load_adj(args.dataset)
+    x_train,y_train = dataloader.data_transform(train,args.n_his,args.n_pred,device)
+    x_val,y_val     = dataloader.data_transform(val,args.n_his,args.n_pred,device)
+    x_test,y_test   = dataloader.data_transform(test,args.n_his,args.n_pred,device)
 
-gso = utility.calc_gso(adj, args.gso_type)
-gso = utility.calc_chebynet_gso(gso)
-gso = torch.from_numpy(gso.toarray().astype(np.float32)).to(device)
+    train_iter = utils.data.DataLoader(utils.data.TensorDataset(x_train,y_train),
+                                       batch_size=args.batch_size,shuffle=True)
+    val_iter   = utils.data.DataLoader(utils.data.TensorDataset(x_val,y_val),
+                                       batch_size=args.batch_size,shuffle=False)
+    test_iter  = utils.data.DataLoader(utils.data.TensorDataset(x_test,y_test),
+                                       batch_size=args.batch_size,shuffle=False)
 
-args.gso = gso
 
-data_path = f'./data/{args.dataset}/vel.csv'
+    return n_vertex, scaler, train_iter, val_iter, test_iter
 
-if not os.path.exists(data_path):
-    raise FileNotFoundError(
-        f"Dataset not found at {data_path}. Please download dataset and place it in ./data/"
-    )
-
-data = pd.read_csv(data_path)
-total = len(data)
-
-train_len = int(total * 0.7)
-val_len = int(total * 0.1)
-
-train = data[:train_len]
-val = data[train_len:train_len + val_len]
-test = data[train_len + val_len:]
-
-scaler = preprocessing.StandardScaler()
-
-train = scaler.fit_transform(train)
-val = scaler.transform(val)
-test = scaler.transform(test)
-
-x_train, y_train = dataloader.data_transform(train, args.n_his, args.n_pred, device)
-x_val, y_val = dataloader.data_transform(val, args.n_his, args.n_pred, device)
-x_test, y_test = dataloader.data_transform(test, args.n_his, args.n_pred, device)
-
-train_iter = utils.data.DataLoader(
-    utils.data.TensorDataset(x_train, y_train),
-    batch_size=args.batch_size,
-    shuffle=True
-)
-
-val_iter = utils.data.DataLoader(
-    utils.data.TensorDataset(x_val, y_val),
-    batch_size=args.batch_size,
-    shuffle=False
-)
-
-test_iter = utils.data.DataLoader(
-    utils.data.TensorDataset(x_test, y_test),
-    batch_size=args.batch_size,
-    shuffle=False
-)
-
-return n_vertex, scaler, train_iter, val_iter, test_iter
-```
 
 # ================= MODEL =================
-
 def prepare_model(args, blocks, n_vertex, device):
+    loss = nn.MSELoss()
+    es = earlystopping.EarlyStopping(
+        patience=args.patience,
+        path=f"STGCN_BASELINE_{args.dataset}.pt"
+    )
 
-```
-loss = nn.MSELoss()
+    model = models.TAGM_STGCN(args, blocks, n_vertex).to(device)
+    # ORIGINAL PAPER OPTIMIZE
+    optimizer = torch.optim.RMSprop(model.parameters(), lr=args.lr, alpha=0.9)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.7)
 
-es = earlystopping.EarlyStopping(
-    patience=args.patience,
-    path=f"STGCN_BASELINE_{args.dataset}.pt"
-)
-
-model = models.TAGM_STGCN(args, blocks, n_vertex).to(device)
-
-optimizer = torch.optim.RMSprop(
-    model.parameters(),
-    lr=args.lr,
-    alpha=0.9
-)
-
-scheduler = torch.optim.lr_scheduler.StepLR(
-    optimizer,
-    step_size=5,
-    gamma=0.7
-)
-
-return loss, es, model, optimizer, scheduler
-```
+    return loss, es, model, optimizer, scheduler
 
 # ================= TRAIN =================
-
-def train(args, model, loss, optimizer, scheduler, es, train_iter, val_iter):
-
-```
-train_losses = []
-val_losses = []
-
-for epoch in range(args.epochs):
-
-    model.train()
-    total = 0
-    n = 0
-
-    for x, y in train_iter:
-
-        optimizer.zero_grad()
-
+def train(args,model,loss,optimizer,scheduler,es,train_iter,val_iter):
+    train_losses = []
+    val_losses = []
+    
+    for epoch in range(args.epochs):
+        model.train()
+        total=0;n=0
+        for x,y in tqdm.tqdm(train_iter):
+            optimizer.zero_grad()
+            pred,_ = model(x)
+            l = loss(pred, y)
+            l.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(),5)
+            optimizer.step()
+            total+=l.item()*y.size(0)
+            n+=y.size(0)
+            
+        scheduler.step()
+        val_loss=validate(model,val_iter,loss)
+        train_losses.append(total/n)
+        val_losses.append(val_loss)
+        print(f"Epoch {epoch+1:03d} | Train {total/n:.4f} | Val {val_loss:.4f}")
+        es(val_loss,model)
+        if es.early_stop:
+            print("Early stopping")
+            break
+            
+    return train_losses, val_losses
+    
+@torch.no_grad()
+def validate(model,val_iter,loss):
+    model.eval()
+    tot=0;n=0
+    for x,y in val_iter:
         pred, _ = model(x)
-        l = loss(pred, y)
+        l=loss(pred,y)
+        tot+=l.item()*y.size(0)
+        n+=y.size(0)
+    return tot/n
 
-        l.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 5)
-
-        optimizer.step()
-
-        total += l.item() * y.size(0)
-        n += y.size(0)
-
-    scheduler.step()
-
-    val_loss = validate(model, val_iter, loss)
-
-    train_losses.append(total / n)
-    val_losses.append(val_loss)
-
-    print(f"Epoch {epoch + 1:03d} | Train {total / n:.4f} | Val {val_loss:.4f}")
-
-    es(val_loss, model)
-
-    if es.early_stop:
-        print("Early stopping")
-        break
-
-return train_losses, val_losses
-```
-
+# ================= TEST + ALL PLOTS =================
 @torch.no_grad()
-def validate(model, val_iter, loss):
+def evaluate_and_plot(model,test_iter,scaler,args,EXP_DIR):
+    model.load_state_dict(torch.load(f"STGCN_BASELINE_{args.dataset}.pt"))
+    model.eval()
+    all_preds = []
+    all_true = []
+    graph_plotted = False
+    
+    for x,y in test_iter:
+      pred, _ = model(x)
+      pred = pred.cpu().numpy()
+      y = y.cpu().numpy()
+      B,H,N = pred.shape
+      pred = scaler.inverse_transform(pred.reshape(-1,N)).reshape(B,H,N)
+      y = scaler.inverse_transform(y.reshape(-1,N)).reshape(B,H,N)
+      all_preds.append(pred)
+      all_true.append(y)
+        
+    all_preds = np.concatenate(all_preds,axis=0)  
+    all_true = np.concatenate(all_true,axis=0)
 
-```
-model.eval()
-total = 0
-n = 0
 
-for x, y in val_iter:
+    # ===== 1. Horizon MAE =====
+    horizons = [5*(i+1) for i in range(12)]
+    mae_list = []
+    for i in range(12):
+        pred_h = all_preds[:,i,:]
+        true_h = all_true[:,i,:]
+        mae = np.mean(np.abs(pred_h - true_h))
+        mae_list.append(mae)
 
-    pred, _ = model(x)
-    l = loss(pred, y)
 
-    total += l.item() * y.size(0)
-    n += y.size(0)
+    plt.figure()
+    plt.plot(horizons, mae_list, marker='o', linewidth=2)
+    plt.grid(True)
+    plt.title("MAE vs Horizon")
+    plt.xlabel("Prediction Horizon (5-minute steps)")
+    plt.ylabel("MAE")
+    plt.savefig(f"{EXP_DIR}/mae_vs_horizon_baseline_{args.dataset}.png",dpi=300)
+    plt.close()
 
-return total / n
-```
 
-# ================= TEST + PLOTS =================
+    # ===== 2. Prediction vs GT =====
+    plt.figure()
+    plt.plot(all_true[:300,0], label="Ground Truth")
+    plt.plot(all_preds[:300,0], label="Prediction")
+    plt.legend()
+    plt.title("Prediction vs Ground Truth")
+    plt.savefig(f"{EXP_DIR}/prediction_vs_gt_baseline_{args.dataset}.png", dpi=300)
+    plt.close()
 
-@torch.no_grad()
-def evaluate_and_plot(model, test_iter, scaler, args, exp_dir):
 
-```
-model.load_state_dict(torch.load(f"STGCN_BASELINE_{args.dataset}.pt"))
-model.eval()
+    # ===== 3. Error Distribution =====
+    errors = np.abs(all_preds - all_true).flatten()
+    plt.figure()
+    plt.hist(errors, bins=50)
+    plt.title("Absolute Error Distribution")
+    plt.savefig(f"{EXP_DIR}/error_distribution_baseline_{args.dataset}.png", dpi=300)
+    plt.close()
 
-all_preds = []
-all_true = []
 
-for x, y in test_iter:
+    # ===== 4. Confusion Matrix =====
+    y_true_c = np.zeros_like(all_true)
+    y_pred_c = np.zeros_like(all_preds)
+    y_true_c[all_true > 20] = 1
+    y_true_c[all_true > 40] = 2
+    y_pred_c[all_preds > 20] = 1
+    y_pred_c[all_preds > 40] = 2
 
-    pred, _ = model(x)
+    cm = confusion_matrix(y_true_c.flatten(), y_pred_c.flatten())
+    plt.figure()
+    sns.heatmap(cm,annot=True,fmt='d',cmap="Blues",
+            xticklabels=["Low","Medium","High"],
+            yticklabels=["Low","Medium","High"])
+    plt.title("Traffic Regime Confusion Matrix")
+    plt.savefig(f"{EXP_DIR}/confusion_matrix_baseline_{args.dataset}.png", dpi=300)
+    plt.close()
 
-    pred = pred.cpu().numpy()
-    y = y.cpu().numpy()
-
-    B, H, N = pred.shape
-
-    pred = scaler.inverse_transform(pred.reshape(-1, N)).reshape(B, H, N)
-    y = scaler.inverse_transform(y.reshape(-1, N)).reshape(B, H, N)
-
-    all_preds.append(pred)
-    all_true.append(y)
-
-all_preds = np.concatenate(all_preds, axis=0)
-all_true = np.concatenate(all_true, axis=0)
-
-# MAE vs Horizon
-horizons = [5 * (i + 1) for i in range(12)]
-mae_list = []
-
-for i in range(12):
-    mae = np.mean(np.abs(all_preds[:, i, :] - all_true[:, i, :]))
-    mae_list.append(mae)
-
-plt.figure()
-plt.plot(horizons, mae_list, marker='o')
-plt.grid(True)
-plt.xlabel("Prediction Horizon")
-plt.ylabel("MAE")
-plt.savefig(f"{exp_dir}/mae_vs_horizon.png", dpi=300)
-plt.close()
-
-# Prediction vs Ground Truth
-plt.figure()
-plt.plot(all_true[:300, 0], label="Ground Truth")
-plt.plot(all_preds[:300, 0], label="Prediction")
-plt.legend()
-plt.savefig(f"{exp_dir}/prediction_vs_gt.png", dpi=300)
-plt.close()
-
-# Error Distribution
-errors = np.abs(all_preds - all_true).flatten()
-plt.figure()
-plt.hist(errors, bins=50)
-plt.savefig(f"{exp_dir}/error_distribution.png", dpi=300)
-plt.close()
-
-# Confusion Matrix
-y_true_c = np.zeros_like(all_true)
-y_pred_c = np.zeros_like(all_preds)
-
-y_true_c[all_true > 20] = 1
-y_true_c[all_true > 40] = 2
-
-y_pred_c[all_preds > 20] = 1
-y_pred_c[all_preds > 40] = 2
-
-cm = confusion_matrix(y_true_c.flatten(), y_pred_c.flatten())
-
-plt.figure()
-sns.heatmap(cm, annot=True, fmt='d')
-plt.savefig(f"{exp_dir}/confusion_matrix.png", dpi=300)
-plt.close()
-
-mean_mae = float(np.mean(np.abs(all_preds - all_true)))
-
-return mean_mae
-```
+    errors = np.abs(all_preds - all_true)
+    mean_mae = float(np.mean(errors))
+    print("All plots saved successfully.")
+    print("Final MAE:", mean_mae)
+    return mean_mae
 
 # ================= RUN =================
+if __name__=="__main__":
 
-if **name** == "**main**":
+    logging.basicConfig(level=logging.INFO)
+    warnings.filterwarnings("ignore")
+    args,device,blocks=get_parameters()
+    n_vertex,scaler,train_iter,val_iter,test_iter=data_preparate(args,device)
+    loss,es,model,optimizer,scheduler=prepare_model(args,blocks,n_vertex,device)
+    train_losses, val_losses = train(args,model,loss,optimizer,scheduler,es,train_iter,val_iter)
 
-```
-logging.basicConfig(level=logging.INFO)
-warnings.filterwarnings("ignore")
+    # ===== Loss Curve =====
+    EXP_DIR="experiments"
+    os.makedirs(EXP_DIR,exist_ok=True)
+    plt.figure()
+    plt.plot(train_losses,label="Train")
+    plt.plot(val_losses,label="Validation")
+    plt.legend()
+    plt.grid(True)
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Training vs Validation Loss")
+    plt.savefig(f"{EXP_DIR}/loss_curve_baseline_{args.dataset}.png",dpi=300)
+    plt.close()
 
-args, device, blocks = get_parameters()
+    final_mae = evaluate_and_plot(model,test_iter,scaler,args,EXP_DIR)
 
-n_vertex, scaler, train_iter, val_iter, test_iter = data_prepare(args, device)
+    import json
+    results = {
+        "model": "baseline",
+        "dataset": args.dataset,
+        "mae": final_mae
+    }
+    with open(f"{EXP_DIR}/results_baseline_{args.dataset}.json", "w") as f:
+      json.dump(results, f)
 
-loss, es, model, optimizer, scheduler = prepare_model(args, blocks, n_vertex, device)
-
-train_losses, val_losses = train(
-    args, model, loss, optimizer, scheduler, es, train_iter, val_iter
-)
-
-exp_dir = "experiments"
-os.makedirs(exp_dir, exist_ok=True)
-
-plt.figure()
-plt.plot(train_losses, label="Train")
-plt.plot(val_losses, label="Validation")
-plt.legend()
-plt.savefig(f"{exp_dir}/loss_curve.png", dpi=300)
-plt.close()
-
-final_mae = evaluate_and_plot(model, test_iter, scaler, args, exp_dir)
-
-results = {
-    "model": "baseline",
-    "dataset": args.dataset,
-    "mae": final_mae
-}
-
-with open(f"{exp_dir}/results.json", "w") as f:
-    json.dump(results, f, indent=4)
-
-print("Experiment complete.")
-```
+    print("Results JSON saved.")
+    print("Experiment complete.")
